@@ -40,6 +40,7 @@ import (
 	"log"
 	"os"
 	osexec "os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -344,6 +345,9 @@ func containerStatsToResponse(s *docker.ContainerStats) statsResponse {
 
 // ---- binding ------------------------------------------------------------
 
+// WARNING: Docker operations are not cell-scoped. Any cell declaring spawn.docker
+// can manage ALL containers on the host. This is acceptable while Bananagine is the
+// sole consumer but must be addressed before multi-cell Docker deployments.
 func bindActive(b wazero.HostModuleBuilder, _ ext.Cell) error {
 	b.NewFunctionBuilder().WithFunc(dockerList).Export("docker_list")
 	b.NewFunctionBuilder().WithFunc(dockerGet).Export("docker_get")
@@ -727,7 +731,29 @@ func dockerBuild(ctx context.Context, m api.Module, reqPtr, reqLen uint32) uint3
 		buildMu.Unlock()
 		return codeMsgpackDecode
 	}
-	if req.ImageTag == "" || req.BuildDir == "" {
+	if req.ImageTag == "" {
+		buildMu.Unlock()
+		return codeInvalidRequest
+	}
+
+	// Path validation: restrict BuildDir to the templates directory.
+	if req.BuildDir == "" {
+		req.BuildDir = os.Getenv("TEMPLATES_DIR")
+		if req.BuildDir == "" {
+			req.BuildDir = "/app/templates"
+		}
+	}
+	absDir, err := filepath.Abs(req.BuildDir)
+	if err != nil {
+		buildMu.Unlock()
+		return codeInvalidRequest
+	}
+	allowedBase := os.Getenv("TEMPLATES_DIR")
+	if allowedBase == "" {
+		allowedBase = "/app/templates"
+	}
+	absBase, _ := filepath.Abs(allowedBase)
+	if !strings.HasPrefix(absDir, absBase) {
 		buildMu.Unlock()
 		return codeInvalidRequest
 	}
