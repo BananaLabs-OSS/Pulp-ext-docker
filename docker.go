@@ -343,23 +343,253 @@ func containerStatsToResponse(s *docker.ContainerStats) statsResponse {
 	}
 }
 
+// ---- security: bind-mount allowlist -------------------------------------
+//
+// docker_create forwards createRequest.Volumes verbatim into the provider,
+// which builds Docker binds as host+":"+container with NO validation. A cell
+// could request {"/var/run/docker.sock":...} or {"/":"/host"} and then exec
+// into the resulting container — that is a complete host takeover (socket-in-
+// container trivially spawns a privileged container mounting /).
+//
+// This guard mirrors the egress-guard pattern in Pulp-ext-http: a deny-list of
+// sensitive host paths/prefixes that can NEVER be a bind source, plus an
+// allow-root model — every bind source must resolve (after symlink eval) to a
+// path under one of the designated safe mount roots. Default is deny-all
+// unless DOCKER_BIND_ROOTS is configured, so a misconfigured deployment fails
+// closed rather than exposing the host.
+
+// errBlockedMount is returned when a requested bind-mount source is rejected.
+var errBlockedMount = errors.New("docker bind-mount guard: source path is not under an allowed mount root")
+
+// deniedMountPaths are host paths that may NEVER be bind-mounted, regardless of
+// the configured allow-roots. They are checked against the symlink-resolved,
+// cleaned absolute source. Entries are matched as the path itself OR any path
+// nested beneath them (so /etc also denies /etc/passwd).
+var deniedMountPaths = []string{
+	"/",
+	"/var/run/docker.sock",
+	"/run/docker.sock",
+	"/var/run",
+	"/run",
+	"/etc",
+	"/proc",
+	"/sys",
+	"/dev",
+	"/boot",
+	"/root",
+	"/home",
+	"/usr",
+	"/bin",
+	"/sbin",
+	"/lib",
+	"/lib64",
+	"/var/lib/docker",
+	"/var/lib",
+}
+
+// pathContains reports whether target == base or target is nested under base.
+// Both are expected to be cleaned absolute paths. The separator check prevents
+// the sibling-prefix bypass (/etcfoo is NOT under /etc).
+//
+// The path separator is taken from base so the check is correct on whichever
+// OS produced the paths: the unix deny-list ("/etc", …) compares against unix
+// sources, while a Windows-rooted allow-root compares against Windows sources.
+func pathContains(base, target string) bool {
+	if base == target {
+		return true
+	}
+	sep := "/"
+	if strings.ContainsRune(base, '\\') || (len(base) >= 2 && base[1] == ':') {
+		sep = string(filepath.Separator)
+	}
+	// A pure-root base ("/" or "C:\") already ends in the separator; appending
+	// another would over-match. Normalize to a single trailing separator.
+	if strings.HasSuffix(base, sep) {
+		return strings.HasPrefix(target, base)
+	}
+	return strings.HasPrefix(target, base+sep)
+}
+
+// allowedMountRoots returns the configured safe mount roots from
+// DOCKER_BIND_ROOTS (OS-path-list separated, ':' on unix). Empty/unset means
+// no roots are allowed → all bind-mounts are rejected (fail closed).
+func allowedMountRoots() []string {
+	raw := os.Getenv("DOCKER_BIND_ROOTS")
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	var roots []string
+	for _, entry := range filepath.SplitList(raw) {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		abs, err := filepath.Abs(entry)
+		if err != nil {
+			continue
+		}
+		// Resolve symlinks where possible so the comparison base matches the
+		// resolved source; fall back to the cleaned abs path if the root does
+		// not yet exist.
+		if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+			abs = resolved
+		}
+		roots = append(roots, filepath.Clean(abs))
+	}
+	return roots
+}
+
+// validateMountSource reports whether a single bind source host path is safe to
+// mount. It rejects the deny-list and anything not under an allowed root.
+func validateMountSource(src string, roots []string) error {
+	if strings.TrimSpace(src) == "" {
+		return fmt.Errorf("%w: empty source", errBlockedMount)
+	}
+	abs, err := filepath.Abs(src)
+	if err != nil {
+		return fmt.Errorf("%w: %v", errBlockedMount, err)
+	}
+	abs = filepath.Clean(abs)
+	// Resolve symlinks so a symlink inside an allowed root that points at /etc
+	// (or the docker socket) cannot slip past the deny-list / root check.
+	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+		abs = filepath.Clean(resolved)
+	}
+	for _, denied := range deniedMountPaths {
+		if pathContains(denied, abs) {
+			return fmt.Errorf("%w: %s is a protected host path", errBlockedMount, abs)
+		}
+	}
+	for _, root := range roots {
+		if pathContains(root, abs) {
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: %s", errBlockedMount, abs)
+}
+
+// validateVolumes checks every bind source in a create request. Returns the
+// first violation, or nil if all sources are permitted (or there are none).
+func validateVolumes(volumes map[string]string) error {
+	if len(volumes) == 0 {
+		return nil
+	}
+	roots := allowedMountRoots()
+	for src := range volumes {
+		if err := validateMountSource(src, roots); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ---- security: per-cell container ownership scoping ---------------------
+//
+// The spawn.docker capability is otherwise all-or-nothing: any cell holding it
+// could destroy/exec/read-files/restart ANY container on the host, including
+// sibling products and host infra. We scope cell-targetable operations to
+// containers THIS cell created, identified by a deterministic name prefix
+// stamped at create time (mirroring how ext-sqlite keys state by cellID).
+//
+// Bananagine is the legitimate whole-host orchestrator; it sets
+// DOCKER_SCOPE_DISABLE=1 to retain unscoped control. With scoping enabled
+// (the default), create() forces the container name into the cell's namespace
+// and the mutating handlers refuse targets that don't carry the caller's prefix.
+
+// scopingDisabled reports whether per-cell container scoping is turned off
+// (whole-host mode for a trusted sole orchestrator like Bananagine).
+func scopingDisabled() bool {
+	v := strings.TrimSpace(os.Getenv("DOCKER_SCOPE_DISABLE"))
+	return v == "1" || strings.EqualFold(v, "true")
+}
+
+// sanitizeCellID maps a cell name to a Docker-name-safe token. Docker names
+// must match [a-zA-Z0-9][a-zA-Z0-9_.-]+; cell names are operator-authored but
+// we normalize defensively so the prefix is always a legal, separator-free
+// token (also closes any path/name-injection via an exotic cell name).
+func sanitizeCellID(cellID string) string {
+	var b strings.Builder
+	for _, r := range cellID {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+			b.WriteRune(r)
+		case r == '_' || r == '.' || r == '-':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('_')
+		}
+	}
+	s := b.String()
+	if s == "" {
+		s = "cell"
+	}
+	return s
+}
+
+// cellPrefix is the container-name namespace for a cell: "pulp-<cellID>-".
+func cellPrefix(cellID string) string {
+	return "pulp-" + sanitizeCellID(cellID) + "-"
+}
+
+// nameOwnedByCell reports whether a container name belongs to cellID. Docker
+// prefixes inspected names with a leading "/", which we trim before testing.
+func nameOwnedByCell(name, cellID string) bool {
+	name = strings.TrimPrefix(name, "/")
+	return strings.HasPrefix(name, cellPrefix(cellID))
+}
+
+// authorizeTarget verifies that the container identified by target (ID or name)
+// is owned by cellID. It returns codeOK when allowed, a non-OK host code
+// otherwise. Scoping is skipped entirely when DOCKER_SCOPE_DISABLE is set.
+func authorizeTarget(ctx context.Context, p *docker.DockerProvider, cellID, target string) uint32 {
+	if scopingDisabled() {
+		return codeOK
+	}
+	// A bare prefix-named target the cell supplied is trusted only after we
+	// confirm the daemon agrees the container exists under that name. Resolve
+	// via the provider (accepts ID or name) and check the canonical name.
+	server, err := p.Get(ctx, target)
+	if err != nil {
+		return translateDockerErr(err)
+	}
+	if !nameOwnedByCell(server.Name, cellID) {
+		// Don't reveal existence of containers the cell doesn't own — report
+		// not-found rather than a distinct "forbidden" code.
+		return codeNotFound
+	}
+	return codeOK
+}
+
 // ---- binding ------------------------------------------------------------
 
-// WARNING: Docker operations are not cell-scoped. Any cell declaring spawn.docker
-// can manage ALL containers on the host. This is acceptable while Bananagine is the
-// sole consumer but must be addressed before multi-cell Docker deployments.
-func bindActive(b wazero.HostModuleBuilder, _ ext.Cell) error {
+// Container operations are scoped per cell via a name-prefix ownership check
+// (see authorizeTarget) and bind-mounts are restricted to an allowed root set
+// (see validateVolumes). The legacy whole-host behaviour — any spawn.docker
+// cell managing ALL containers — is available only behind DOCKER_SCOPE_DISABLE
+// for a trusted sole orchestrator (Bananagine).
+func bindActive(b wazero.HostModuleBuilder, cell ext.Cell) error {
+	cellID := cell.Name()
+	wrap4 := func(h func(context.Context, api.Module, string, uint32, uint32, uint32, uint32) uint32) func(context.Context, api.Module, uint32, uint32, uint32, uint32) uint32 {
+		return func(ctx context.Context, m api.Module, a, bb, c, d uint32) uint32 {
+			return h(ctx, m, cellID, a, bb, c, d)
+		}
+	}
+	wrap2 := func(h func(context.Context, api.Module, string, uint32, uint32) uint32) func(context.Context, api.Module, uint32, uint32) uint32 {
+		return func(ctx context.Context, m api.Module, a, bb uint32) uint32 {
+			return h(ctx, m, cellID, a, bb)
+		}
+	}
 	b.NewFunctionBuilder().WithFunc(dockerList).Export("docker_list")
 	b.NewFunctionBuilder().WithFunc(dockerGet).Export("docker_get")
-	b.NewFunctionBuilder().WithFunc(dockerCreate).Export("docker_create")
-	b.NewFunctionBuilder().WithFunc(dockerDestroy).Export("docker_destroy")
-	b.NewFunctionBuilder().WithFunc(dockerRestart).Export("docker_restart")
-	b.NewFunctionBuilder().WithFunc(dockerExec).Export("docker_exec")
-	b.NewFunctionBuilder().WithFunc(dockerLogs).Export("docker_logs")
-	b.NewFunctionBuilder().WithFunc(dockerStats).Export("docker_stats")
-	b.NewFunctionBuilder().WithFunc(dockerFilesRead).Export("docker_files_read")
-	b.NewFunctionBuilder().WithFunc(dockerFilesWrite).Export("docker_files_write")
-	b.NewFunctionBuilder().WithFunc(dockerFilesDelete).Export("docker_files_delete")
+	b.NewFunctionBuilder().WithFunc(wrap4(dockerCreate)).Export("docker_create")
+	b.NewFunctionBuilder().WithFunc(wrap2(dockerDestroy)).Export("docker_destroy")
+	b.NewFunctionBuilder().WithFunc(wrap2(dockerRestart)).Export("docker_restart")
+	b.NewFunctionBuilder().WithFunc(wrap4(dockerExec)).Export("docker_exec")
+	b.NewFunctionBuilder().WithFunc(wrap4(dockerLogs)).Export("docker_logs")
+	b.NewFunctionBuilder().WithFunc(wrap4(dockerStats)).Export("docker_stats")
+	b.NewFunctionBuilder().WithFunc(wrap4(dockerFilesRead)).Export("docker_files_read")
+	b.NewFunctionBuilder().WithFunc(wrap2(dockerFilesWrite)).Export("docker_files_write")
+	b.NewFunctionBuilder().WithFunc(wrap2(dockerFilesDelete)).Export("docker_files_delete")
 	b.NewFunctionBuilder().WithFunc(dockerEventsPoll).Export("docker_events_poll")
 	b.NewFunctionBuilder().WithFunc(dockerStatsAll).Export("docker_stats_all")
 	b.NewFunctionBuilder().WithFunc(dockerBuild).Export("docker_build")
@@ -444,7 +674,7 @@ func dockerGet(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut, re
 	return writeMsgpackResponse(ctx, m, serverToResponse(server), respPtrOut, respLenOut)
 }
 
-func dockerCreate(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut, respLenOut uint32) uint32 {
+func dockerCreate(ctx context.Context, m api.Module, cellID string, reqPtr, reqLen, respPtrOut, respLenOut uint32) uint32 {
 	p, err := ensureProvider()
 	if err != nil {
 		return codeProviderUnavail
@@ -459,6 +689,23 @@ func dockerCreate(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut,
 	}
 	if req.Image == "" {
 		return codeInvalidRequest
+	}
+	// Reject host-takeover bind-mounts (docker socket, /, system dirs, and
+	// anything outside the configured safe mount roots).
+	if err := validateVolumes(req.Volumes); err != nil {
+		return codeInvalidRequest
+	}
+	// Stamp the cell's ownership namespace onto the container name so later
+	// destroy/exec/files/restart/logs/stats can verify the caller owns the
+	// target. Skipped only in whole-host mode (DOCKER_SCOPE_DISABLE).
+	if !scopingDisabled() {
+		prefix := cellPrefix(cellID)
+		trimmed := strings.TrimPrefix(req.Name, "/")
+		if !strings.HasPrefix(trimmed, prefix) {
+			req.Name = prefix + trimmed
+		} else {
+			req.Name = trimmed
+		}
 	}
 	ports := make([]orchestrator.PortBinding, len(req.Ports))
 	for i, pb := range req.Ports {
@@ -492,7 +739,7 @@ func dockerCreate(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut,
 	return writeMsgpackResponse(ctx, m, serverToResponse(server), respPtrOut, respLenOut)
 }
 
-func dockerDestroy(ctx context.Context, m api.Module, reqPtr, reqLen uint32) uint32 {
+func dockerDestroy(ctx context.Context, m api.Module, cellID string, reqPtr, reqLen uint32) uint32 {
 	p, err := ensureProvider()
 	if err != nil {
 		return codeProviderUnavail
@@ -507,6 +754,9 @@ func dockerDestroy(ctx context.Context, m api.Module, reqPtr, reqLen uint32) uin
 	}
 	if req.ID == "" {
 		return codeInvalidRequest
+	}
+	if code := authorizeTarget(ctx, p, cellID, req.ID); code != codeOK {
+		return code
 	}
 	if err := p.Deallocate(ctx, req.ID); err != nil {
 		return translateDockerErr(err)
@@ -514,7 +764,7 @@ func dockerDestroy(ctx context.Context, m api.Module, reqPtr, reqLen uint32) uin
 	return codeOK
 }
 
-func dockerRestart(ctx context.Context, m api.Module, reqPtr, reqLen uint32) uint32 {
+func dockerRestart(ctx context.Context, m api.Module, cellID string, reqPtr, reqLen uint32) uint32 {
 	p, err := ensureProvider()
 	if err != nil {
 		return codeProviderUnavail
@@ -530,13 +780,16 @@ func dockerRestart(ctx context.Context, m api.Module, reqPtr, reqLen uint32) uin
 	if req.ID == "" {
 		return codeInvalidRequest
 	}
+	if code := authorizeTarget(ctx, p, cellID, req.ID); code != codeOK {
+		return code
+	}
 	if err := p.Restart(ctx, req.ID); err != nil {
 		return translateDockerErr(err)
 	}
 	return codeOK
 }
 
-func dockerExec(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut, respLenOut uint32) uint32 {
+func dockerExec(ctx context.Context, m api.Module, cellID string, reqPtr, reqLen, respPtrOut, respLenOut uint32) uint32 {
 	p, err := ensureProvider()
 	if err != nil {
 		return codeProviderUnavail
@@ -552,6 +805,9 @@ func dockerExec(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut, r
 	if req.ID == "" || len(req.Cmd) == 0 {
 		return codeInvalidRequest
 	}
+	if code := authorizeTarget(ctx, p, cellID, req.ID); code != codeOK {
+		return code
+	}
 	output, err := p.Exec(ctx, req.ID, req.Cmd)
 	if err != nil {
 		return translateDockerErr(err)
@@ -559,7 +815,7 @@ func dockerExec(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut, r
 	return writeMsgpackResponse(ctx, m, execResponse{Output: output}, respPtrOut, respLenOut)
 }
 
-func dockerLogs(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut, respLenOut uint32) uint32 {
+func dockerLogs(ctx context.Context, m api.Module, cellID string, reqPtr, reqLen, respPtrOut, respLenOut uint32) uint32 {
 	p, err := ensureProvider()
 	if err != nil {
 		return codeProviderUnavail
@@ -575,6 +831,9 @@ func dockerLogs(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut, r
 	if req.ID == "" {
 		return codeInvalidRequest
 	}
+	if code := authorizeTarget(ctx, p, cellID, req.ID); code != codeOK {
+		return code
+	}
 	// Potassium's Logs passes strconv.Itoa(tail) straight to Docker,
 	// which interprets "0" as zero lines (NOT "all"). Normalize: any
 	// non-positive input maps to a sensible 200-line default so cells
@@ -589,7 +848,7 @@ func dockerLogs(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut, r
 	return writeMsgpackResponse(ctx, m, logsResponse{Logs: logs}, respPtrOut, respLenOut)
 }
 
-func dockerStats(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut, respLenOut uint32) uint32 {
+func dockerStats(ctx context.Context, m api.Module, cellID string, reqPtr, reqLen, respPtrOut, respLenOut uint32) uint32 {
 	p, err := ensureProvider()
 	if err != nil {
 		return codeProviderUnavail
@@ -605,6 +864,9 @@ func dockerStats(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut, 
 	if req.ID == "" {
 		return codeInvalidRequest
 	}
+	if code := authorizeTarget(ctx, p, cellID, req.ID); code != codeOK {
+		return code
+	}
 	stats, err := p.Stats(ctx, req.ID)
 	if err != nil {
 		return translateDockerErr(err)
@@ -612,7 +874,7 @@ func dockerStats(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut, 
 	return writeMsgpackResponse(ctx, m, containerStatsToResponse(stats), respPtrOut, respLenOut)
 }
 
-func dockerFilesRead(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut, respLenOut uint32) uint32 {
+func dockerFilesRead(ctx context.Context, m api.Module, cellID string, reqPtr, reqLen, respPtrOut, respLenOut uint32) uint32 {
 	p, err := ensureProvider()
 	if err != nil {
 		return codeProviderUnavail
@@ -628,6 +890,9 @@ func dockerFilesRead(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrO
 	if req.ID == "" || req.Path == "" {
 		return codeInvalidRequest
 	}
+	if code := authorizeTarget(ctx, p, cellID, req.ID); code != codeOK {
+		return code
+	}
 	content, err := p.CopyFrom(ctx, req.ID, req.Path)
 	if err != nil {
 		return translateDockerErr(err)
@@ -635,7 +900,7 @@ func dockerFilesRead(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrO
 	return writeMsgpackResponse(ctx, m, content, respPtrOut, respLenOut)
 }
 
-func dockerFilesWrite(ctx context.Context, m api.Module, reqPtr, reqLen uint32) uint32 {
+func dockerFilesWrite(ctx context.Context, m api.Module, cellID string, reqPtr, reqLen uint32) uint32 {
 	p, err := ensureProvider()
 	if err != nil {
 		return codeProviderUnavail
@@ -651,13 +916,16 @@ func dockerFilesWrite(ctx context.Context, m api.Module, reqPtr, reqLen uint32) 
 	if req.ID == "" || req.Path == "" {
 		return codeInvalidRequest
 	}
+	if code := authorizeTarget(ctx, p, cellID, req.ID); code != codeOK {
+		return code
+	}
 	if err := p.CopyTo(ctx, req.ID, req.Path, req.Data); err != nil {
 		return translateDockerErr(err)
 	}
 	return codeOK
 }
 
-func dockerFilesDelete(ctx context.Context, m api.Module, reqPtr, reqLen uint32) uint32 {
+func dockerFilesDelete(ctx context.Context, m api.Module, cellID string, reqPtr, reqLen uint32) uint32 {
 	p, err := ensureProvider()
 	if err != nil {
 		return codeProviderUnavail
@@ -672,6 +940,9 @@ func dockerFilesDelete(ctx context.Context, m api.Module, reqPtr, reqLen uint32)
 	}
 	if req.Container == "" || req.Path == "" {
 		return codeInvalidRequest
+	}
+	if code := authorizeTarget(ctx, p, cellID, req.Container); code != codeOK {
+		return code
 	}
 	if err := p.DeleteFile(ctx, req.Container, req.Path); err != nil {
 		return translateDockerErr(err)
