@@ -10,21 +10,73 @@ func TestValidateMountSource_DeniesProtectedPaths(t *testing.T) {
 	// allow-root check.
 	roots := []string{"/"}
 	denied := []string{
-		"/",
-		"/var/run/docker.sock",
-		"/run/docker.sock",
-		"/etc",
-		"/etc/passwd",
-		"/proc",
-		"/sys",
-		"/root",
-		"/home/user",
-		"/var/lib/docker",
+		"/",                     // host root, exact-match deny (full-host takeover)
+		"/var/run/docker.sock",  // docker socket
+		"/run/docker.sock",      // docker socket (alt path)
+		"/var/run",              // includes the docker socket dir
+		"/var/run/secrets",      // nested under a denied prefix
+		"/run",                  // includes the docker socket dir (alt)
+		"/etc",                  // host config
+		"/etc/passwd",           // nested under /etc
+		"/proc",                 // kernel
+		"/sys",                  // kernel
+		"/dev",                  // devices
+		"/boot",                 // bootloader/kernel
+		"/root",                 // root home
+		"/var/lib/docker",       // docker state
+		"/var/lib/docker/volumes/x", // nested under docker state
 	}
 	for _, src := range denied {
 		if err := validateMountSource(src, roots); err == nil {
 			t.Errorf("validateMountSource(%q) = nil; want rejection", src)
 		}
+	}
+}
+
+// TestValidateMountSource_AllowsRealWorldMounts pins the legit Bananagine
+// provisioning sources: removing "/" from the deny prefix list (the HIGH
+// regression) must let absolute world mounts through under a configured root.
+//
+// Paths are built from a temp dir so the assertion is OS-agnostic: on the
+// Windows audit host filepath.Abs prepends a drive letter, which would dodge
+// the unix-shaped literals — using t.TempDir() makes source and root share the
+// same volume on every platform. The shape mirrors the real templates:
+// /var/worlds/<id>:/data (bedrock/paper), /var/sessions/worlds/<id> (worlds_dir
+// default), /var/lib/gameserver/.../config.json (hytale).
+func TestValidateMountSource_AllowsRealWorldMounts(t *testing.T) {
+	base := t.TempDir()
+	worldsRoot := filepath.Join(base, "var", "worlds")
+	sessionsRoot := filepath.Join(base, "var", "sessions", "worlds")
+	gameserverRoot := filepath.Join(base, "var", "lib", "gameserver")
+	roots := []string{worldsRoot, sessionsRoot, gameserverRoot}
+
+	allowed := []string{
+		filepath.Join(worldsRoot, "srv-1"),                                            // bedrock/paper template
+		filepath.Join(sessionsRoot, "srv-1"),                                          // worlds_dir default
+		filepath.Join(gameserverRoot, "hycraft-server", "server-config", "config.json"), // hytale template
+	}
+	for _, src := range allowed {
+		if err := validateMountSource(src, roots); err != nil {
+			t.Errorf("validateMountSource(%q) under real bind root = %v; want allow", src, err)
+		}
+	}
+}
+
+// TestValidateMountSource_VarSiblingsSegmentDistinct verifies the segment-aware
+// matching that lets /var/worlds be allowed while /var/run stays denied — a
+// naive /var prefix-deny would wrongly catch the worlds mount.
+func TestValidateMountSource_VarSiblingsSegmentDistinct(t *testing.T) {
+	// /var/run is denied via deniedMountPaths; /var/worlds is not. Allow root "/"
+	// so the result is attributable to the deny-list segment logic.
+	roots := []string{"/"}
+	if err := validateMountSource("/var/run/docker.sock", roots); err == nil {
+		t.Error("/var/run/docker.sock must be denied")
+	}
+	if !pathContains("/var/run", "/var/run/docker.sock") {
+		t.Error("/var/run should contain its docker.sock")
+	}
+	if pathContains("/var/run", "/var/worlds/srv-1") {
+		t.Error("/var/run must NOT prefix-match /var/worlds (segment boundary)")
 	}
 }
 

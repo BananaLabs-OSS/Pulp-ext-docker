@@ -361,12 +361,21 @@ func containerStatsToResponse(s *docker.ContainerStats) statsResponse {
 // errBlockedMount is returned when a requested bind-mount source is rejected.
 var errBlockedMount = errors.New("docker bind-mount guard: source path is not under an allowed mount root")
 
-// deniedMountPaths are host paths that may NEVER be bind-mounted, regardless of
-// the configured allow-roots. They are checked against the symlink-resolved,
-// cleaned absolute source. Entries are matched as the path itself OR any path
-// nested beneath them (so /etc also denies /etc/passwd).
+// deniedMountPaths are host paths/prefixes that may NEVER be bind-mounted,
+// regardless of the configured allow-roots. They are checked against the
+// symlink-resolved, cleaned absolute source. Entries are matched as the path
+// itself OR any path nested beneath them (so /etc also denies /etc/passwd).
+//
+// NOTE: the host root "/" is deliberately NOT a prefix entry — a prefix match
+// on "/" would reject EVERY absolute bind source on Linux (the trailing-
+// separator branch of pathContains makes "/" a prefix of all absolute paths),
+// which would block every legitimate world mount (e.g. /var/worlds/...,
+// /var/sessions/worlds/...). The whole-host "/" mount is instead caught by the
+// exact-match deny in validateMountSource. Segment-aware prefix matching keeps
+// these segment-boundary-distinct: /var/run is denied but /var/worlds and
+// /var/sessions (the real provisioning roots) are NOT, even though all share
+// the /var parent.
 var deniedMountPaths = []string{
-	"/",
 	"/var/run/docker.sock",
 	"/run/docker.sock",
 	"/var/run",
@@ -377,14 +386,15 @@ var deniedMountPaths = []string{
 	"/dev",
 	"/boot",
 	"/root",
-	"/home",
-	"/usr",
-	"/bin",
-	"/sbin",
-	"/lib",
-	"/lib64",
 	"/var/lib/docker",
-	"/var/lib",
+}
+
+// deniedExactMountPaths are host paths that may never be bind-mounted as a
+// WHOLE-PATH source but must not be treated as prefixes. The host root "/"
+// lives here: mounting "/" itself is a full-host takeover, but using "/" as a
+// prefix would (wrongly) reject every absolute path.
+var deniedExactMountPaths = []string{
+	"/",
 }
 
 // pathContains reports whether target == base or target is nested under base.
@@ -454,6 +464,11 @@ func validateMountSource(src string, roots []string) error {
 	// (or the docker socket) cannot slip past the deny-list / root check.
 	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
 		abs = filepath.Clean(resolved)
+	}
+	for _, denied := range deniedExactMountPaths {
+		if abs == denied {
+			return fmt.Errorf("%w: %s is a protected host path", errBlockedMount, abs)
+		}
 	}
 	for _, denied := range deniedMountPaths {
 		if pathContains(denied, abs) {
