@@ -1039,7 +1039,7 @@ func dockerBuild(ctx context.Context, m api.Module, reqPtr, reqLen uint32) uint3
 		allowedBase = "/app/templates"
 	}
 	absBase, _ := filepath.Abs(allowedBase)
-	if !strings.HasPrefix(absDir, absBase) {
+	if !pathContains(absBase, absDir) {
 		buildMu.Unlock()
 		return codeInvalidRequest
 	}
