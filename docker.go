@@ -116,10 +116,11 @@ func init() {
 }
 
 var (
-	providerMu  sync.Mutex
-	provider    *docker.DockerProvider
-	providerErr error
-	eventBuf    *eventBuffer
+	providerMu         sync.Mutex
+	provider           *docker.DockerProvider
+	providerErr        error
+	providerRetryAfter time.Time
+	eventBuf           *eventBuffer
 
 	buildMu      sync.Mutex
 	buildStateMu sync.RWMutex
@@ -132,14 +133,19 @@ func ensureProvider() (*docker.DockerProvider, error) {
 	if provider != nil {
 		return provider, nil
 	}
-	if providerErr != nil {
+	// Return the cached error only if the retry backoff window has not expired.
+	// This allows recovery from a startup race (dockerd comes up after Pulp)
+	// without requiring a manual restart of the Pulp host.
+	if providerErr != nil && time.Now().Before(providerRetryAfter) {
 		return nil, providerErr
 	}
 	p, err := docker.New()
 	if err != nil {
 		providerErr = fmt.Errorf("docker: %w", err)
+		providerRetryAfter = time.Now().Add(10 * time.Second)
 		return nil, providerErr
 	}
+	providerErr = nil
 	provider = p
 
 	// Start event consumer that fills the ring buffer for polling.
