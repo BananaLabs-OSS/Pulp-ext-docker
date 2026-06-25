@@ -26,10 +26,13 @@
 //	docker_exec(req, resp)
 //	docker_logs(req, resp)
 //	docker_stats(req, resp)
+//	docker_stats_all(req, resp)
 //	docker_files_read(req, resp)
 //	docker_files_write(req)
 //	docker_files_delete(req)
 //	docker_events_poll(req, resp)
+//	docker_build(req)
+//	docker_build_status(req, resp)
 package dockerext
 
 import (
