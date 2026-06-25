@@ -921,7 +921,10 @@ func dockerFilesRead(ctx context.Context, m api.Module, cellID string, reqPtr, r
 	if err != nil {
 		return translateDockerErr(err)
 	}
-	return writeMsgpackResponse(ctx, m, content, respPtrOut, respLenOut)
+	// Write raw bytes — NOT msgpack-wrapped. The cell-side FilesRead returns
+	// the buffer directly as []byte without decoding; wrapping with msgpack
+	// would produce a bin-format prefix that corrupts every JSON parse.
+	return writeRawResponse(ctx, m, content, respPtrOut, respLenOut)
 }
 
 func dockerFilesWrite(ctx context.Context, m api.Module, cellID string, reqPtr, reqLen uint32) uint32 {
@@ -1116,13 +1119,20 @@ func writeMsgpackResponse(ctx context.Context, m api.Module, v any, respPtrOut, 
 	if err != nil {
 		return codeMsgpackEncode
 	}
+	return writeRawResponse(ctx, m, encoded, respPtrOut, respLenOut)
+}
+
+// writeRawResponse writes pre-encoded bytes directly into cell memory via
+// pulp_alloc without any additional framing. Use this for responses that are
+// already serialized (e.g. raw file content from docker_files_read).
+func writeRawResponse(ctx context.Context, m api.Module, data []byte, respPtrOut, respLenOut uint32) uint32 {
 	allocFn := m.ExportedFunction("pulp_alloc")
 	if allocFn == nil {
 		return codeAllocFailed
 	}
 	var ptr uint32
-	if len(encoded) > 0 {
-		res, err := allocFn.Call(ctx, uint64(len(encoded)))
+	if len(data) > 0 {
+		res, err := allocFn.Call(ctx, uint64(len(data)))
 		if err != nil || len(res) == 0 {
 			return codeAllocFailed
 		}
@@ -1130,14 +1140,14 @@ func writeMsgpackResponse(ctx context.Context, m api.Module, v any, respPtrOut, 
 		if ptr == 0 {
 			return codeAllocFailed
 		}
-		if !m.Memory().Write(ptr, encoded) {
+		if !m.Memory().Write(ptr, data) {
 			return codeMemoryWrite
 		}
 	}
 	if !m.Memory().WriteUint32Le(respPtrOut, ptr) {
 		return codeMemoryWrite
 	}
-	if !m.Memory().WriteUint32Le(respLenOut, uint32(len(encoded))) {
+	if !m.Memory().WriteUint32Le(respLenOut, uint32(len(data))) {
 		return codeMemoryWrite
 	}
 	return codeOK
