@@ -3,6 +3,7 @@ module github.com/BananaLabs-OSS/Pulp-ext-docker
 go 1.25.6
 
 require (
+	github.com/BananaLabs-OSS/Fiber v0.0.0
 	github.com/BananaLabs-OSS/Pulp v0.0.0
 	github.com/bananalabs-oss/potassium v0.9.3
 	github.com/tetratelabs/wazero v1.11.0
@@ -43,6 +44,7 @@ require (
 )
 
 replace (
+	github.com/BananaLabs-OSS/Fiber => ../Fiber
 	github.com/BananaLabs-OSS/Pulp => ../Pulp
 	github.com/bananalabs-oss/potassium => ../Potassium
 )

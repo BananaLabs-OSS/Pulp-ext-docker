@@ -112,58 +112,134 @@ func translateDockerErr(err error) uint32 {
 
 func init() {
 	ext.Register(ext.Capability{
-		Name:     "spawn.docker",
-		Register: bindActive,
-		Stub:     bindStub,
+		Name:          "spawn.docker",
+		Register:      bindActive,
+		Stub:          bindStub,
+		Setup:         setupDockerScope,
+		TeardownScope: teardownDockerScope,
+		TeardownCell:  teardownDockerCell,
 	})
 }
 
-var (
-	providerMu         sync.Mutex
+type dockerScopeContextKey struct{}
+
+// dockerScopeState owns every mutable Docker-extension resource for one Pulp
+// application/cell instance. Docker package bytes are shared, but clients,
+// event buffers, build state, and cancellation never cross a Scope boundary.
+type dockerScopeState struct {
+	scope              ext.Scope
+	mu                 sync.Mutex
 	provider           *docker.DockerProvider
 	providerErr        error
 	providerRetryAfter time.Time
 	eventBuf           *eventBuffer
+	eventsCancel       context.CancelFunc
 
 	buildMu      sync.Mutex
 	buildStateMu sync.RWMutex
 	buildState   buildStatusResponse
-)
+}
 
-func ensureProvider() (*docker.DockerProvider, error) {
-	providerMu.Lock()
-	defer providerMu.Unlock()
-	if provider != nil {
-		return provider, nil
+var dockerScopes = struct {
+	sync.Mutex
+	states map[ext.ResourceKey]*dockerScopeState
+	// Routing IDs are supplied to Capability.TeardownCell by the Pulp runtime.
+	// Keeping this reverse lookup lets teardown release exactly one cell even
+	// though the legacy hook takes a string rather than ext.Scope.
+	routes map[string]ext.ResourceKey
+}{states: make(map[ext.ResourceKey]*dockerScopeState), routes: make(map[string]ext.ResourceKey)}
+
+func withDockerScope(ctx context.Context, scope ext.Scope) context.Context {
+	return context.WithValue(ctx, dockerScopeContextKey{}, scope)
+}
+
+func dockerScopeFromContext(ctx context.Context) ext.Scope {
+	if ctx != nil {
+		if scope, ok := ctx.Value(dockerScopeContextKey{}).(ext.Scope); ok {
+			if err := scope.Validate(); err == nil {
+				return scope
+			}
+		}
+	}
+	return ext.LegacyScope("docker")
+}
+
+func dockerStateForScope(scope ext.Scope) (*dockerScopeState, error) {
+	owner, err := dockerApplicationScope(scope)
+	if err != nil {
+		return nil, err
+	}
+	key, err := owner.ResourceKey("spawn.docker", "runtime")
+	if err != nil {
+		return nil, err
+	}
+	dockerScopes.Lock()
+	defer dockerScopes.Unlock()
+	if state := dockerScopes.states[key]; state != nil {
+		dockerScopes.routes[scope.RoutingID()] = key
+		dockerScopes.routes[owner.RoutingID()] = key
+		return state, nil
+	}
+	state := &dockerScopeState{scope: owner}
+	dockerScopes.states[key] = state
+	// Retain both the application setup route and every registered cell route
+	// so TeardownCell can release an app only when it actually owns the last
+	// resource (TeardownScope remains the authoritative app shutdown hook).
+	dockerScopes.routes[scope.RoutingID()] = key
+	dockerScopes.routes[owner.RoutingID()] = key
+	return state, nil
+}
+
+func dockerApplicationScope(scope ext.Scope) (ext.Scope, error) {
+	if err := scope.Validate(); err != nil {
+		return ext.Scope{}, err
+	}
+	if scope.IsLegacy() {
+		return ext.LegacyScope("host"), nil
+	}
+	return ext.NewScope(scope.ApplicationID(), scope.ApplicationInstanceID(), "host", "primary")
+}
+
+func dockerStateForContext(ctx context.Context) (*dockerScopeState, error) {
+	return dockerStateForScope(dockerScopeFromContext(ctx))
+}
+
+func (s *dockerScopeState) ensureProvider() (*docker.DockerProvider, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.provider != nil {
+		return s.provider, nil
 	}
 	// Return the cached error only if the retry backoff window has not expired.
 	// This allows recovery from a startup race (dockerd comes up after Pulp)
 	// without requiring a manual restart of the Pulp host.
-	if providerErr != nil && time.Now().Before(providerRetryAfter) {
-		return nil, providerErr
+	if s.providerErr != nil && time.Now().Before(s.providerRetryAfter) {
+		return nil, s.providerErr
 	}
 	p, err := docker.New()
 	if err != nil {
-		providerErr = fmt.Errorf("docker: %w", err)
-		providerRetryAfter = time.Now().Add(10 * time.Second)
-		return nil, providerErr
+		s.providerErr = fmt.Errorf("docker: %w", err)
+		s.providerRetryAfter = time.Now().Add(10 * time.Second)
+		return nil, s.providerErr
 	}
-	providerErr = nil
-	provider = p
+	s.providerErr = nil
+	s.provider = p
 
 	// Start event consumer that fills the ring buffer for polling.
 	// Docker's SDK hands back channels immediately, so we can't use
 	// the channel call itself to confirm a good subscription —
 	// backoff is only reset after we actually receive an event.
-	eventBuf = newEventBuffer(1000, 5*time.Minute)
+	s.eventBuf = newEventBuffer(1000, 5*time.Minute)
+	eventsCtx, cancel := context.WithCancel(context.Background())
+	s.eventsCancel = cancel
 	go func() {
-		ctx := context.Background()
+		ctx := eventsCtx
 		backoff := time.Second
 		for {
 			if ctx.Err() != nil {
 				return
 			}
-			ch, errCh := provider.Events(ctx)
+			ch, errCh := p.Events(ctx)
 			gotEvent := false
 		consume:
 			for {
@@ -173,7 +249,7 @@ func ensureProvider() (*docker.DockerProvider, error) {
 						log.Printf("[pulp-ext-docker] events channel closed, reconnecting")
 						break consume
 					}
-					eventBuf.append(ev.ContainerID, ev.Name, ev.Action)
+					s.eventBuf.append(ev.ContainerID, ev.Name, ev.Action)
 					if !gotEvent {
 						backoff = time.Second
 						gotEvent = true
@@ -202,7 +278,61 @@ func ensureProvider() (*docker.DockerProvider, error) {
 		}
 	}()
 
-	return provider, nil
+	return p, nil
+}
+
+func ensureProvider(ctx context.Context) (*docker.DockerProvider, error) {
+	state, err := dockerStateForContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return state.ensureProvider()
+}
+
+func setupDockerScope(env ext.SetupEnv) error {
+	_, err := dockerStateForScope(env.EffectiveScope())
+	return err
+}
+
+// teardownDockerScope releases precisely the resources set up for one Pulp
+// application. It never infers scope from teardown order, so stopping one app
+// cannot cancel another app's Docker events or discard its build state.
+func teardownDockerScope(_ context.Context, scope ext.Scope) error {
+	owner, err := dockerApplicationScope(scope)
+	if err != nil {
+		return err
+	}
+	key, err := owner.ResourceKey("spawn.docker", "runtime")
+	if err != nil {
+		return err
+	}
+	dockerScopes.Lock()
+	state := dockerScopes.states[key]
+	delete(dockerScopes.states, key)
+	for route, routeKey := range dockerScopes.routes {
+		if routeKey == key {
+			delete(dockerScopes.routes, route)
+		}
+	}
+	dockerScopes.Unlock()
+	if state != nil && state.eventsCancel != nil {
+		state.eventsCancel()
+	}
+	return nil
+}
+
+func teardownDockerCell(_ context.Context, routingID string) error {
+	dockerScopes.Lock()
+	_, ok := dockerScopes.routes[routingID]
+	if !ok {
+		// Old Pulp hosts pass a simple cell name. It is intentionally not used
+		// to release a scoped resource: that name is ambiguous across apps.
+		dockerScopes.Unlock()
+		return nil
+	}
+	delete(dockerScopes.routes, routingID)
+	dockerScopes.Unlock()
+	return nil
 }
 
 // ---- request / response types -------------------------------------------
@@ -555,6 +685,19 @@ func cellPrefix(cellID string) string {
 	return "pulp-" + sanitizeCellID(cellID) + "-"
 }
 
+// scopePrefix names containers with their full application and cell placement.
+// Legacy callers retain the original cell-only prefix so existing containers
+// remain addressable after an extension upgrade.
+func scopePrefix(scope ext.Scope) string {
+	if scope.IsLegacy() {
+		return cellPrefix(scope.CellID())
+	}
+	return "pulp-" + strings.Join([]string{
+		sanitizeCellID(scope.ApplicationID()), sanitizeCellID(scope.ApplicationInstanceID()),
+		sanitizeCellID(scope.CellID()), sanitizeCellID(scope.CellInstanceID()),
+	}, "-") + "-"
+}
+
 // nameOwnedByCell reports whether a container name belongs to cellID. Docker
 // prefixes inspected names with a leading "/", which we trim before testing.
 func nameOwnedByCell(name, cellID string) bool {
@@ -562,10 +705,15 @@ func nameOwnedByCell(name, cellID string) bool {
 	return strings.HasPrefix(name, cellPrefix(cellID))
 }
 
+func nameOwnedByScope(name string, scope ext.Scope) bool {
+	name = strings.TrimPrefix(name, "/")
+	return strings.HasPrefix(name, scopePrefix(scope))
+}
+
 // authorizeTarget verifies that the container identified by target (ID or name)
 // is owned by cellID. It returns codeOK when allowed, a non-OK host code
 // otherwise. Scoping is skipped entirely when DOCKER_SCOPE_DISABLE is set.
-func authorizeTarget(ctx context.Context, p *docker.DockerProvider, cellID, target string) uint32 {
+func authorizeTarget(ctx context.Context, p *docker.DockerProvider, _ string, target string) uint32 {
 	if scopingDisabled() {
 		return codeOK
 	}
@@ -576,7 +724,7 @@ func authorizeTarget(ctx context.Context, p *docker.DockerProvider, cellID, targ
 	if err != nil {
 		return translateDockerErr(err)
 	}
-	if !nameOwnedByCell(server.Name, cellID) {
+	if !nameOwnedByScope(server.Name, dockerScopeFromContext(ctx)) {
 		// Don't reveal existence of containers the cell doesn't own — report
 		// not-found rather than a distinct "forbidden" code.
 		return codeNotFound
@@ -593,18 +741,31 @@ func authorizeTarget(ctx context.Context, p *docker.DockerProvider, cellID, targ
 // for a trusted sole orchestrator (Bananagine).
 func bindActive(b wazero.HostModuleBuilder, cell ext.Cell) error {
 	cellID := cell.Name()
+	scope := ext.ScopeOf(cell)
+	// Every imported function captures the exact cell placement. A request
+	// context cannot be trusted to carry application identity because the WASM
+	// guest controls its own call flow.
+	withScope := func(ctx context.Context) context.Context { return withDockerScope(ctx, scope) }
+	wrapScoped4 := func(h func(context.Context, api.Module, uint32, uint32, uint32, uint32) uint32) func(context.Context, api.Module, uint32, uint32, uint32, uint32) uint32 {
+		return func(ctx context.Context, m api.Module, a, bb, c, d uint32) uint32 {
+			return h(withScope(ctx), m, a, bb, c, d)
+		}
+	}
+	wrapScoped2 := func(h func(context.Context, api.Module, uint32, uint32) uint32) func(context.Context, api.Module, uint32, uint32) uint32 {
+		return func(ctx context.Context, m api.Module, a, bb uint32) uint32 { return h(withScope(ctx), m, a, bb) }
+	}
 	wrap4 := func(h func(context.Context, api.Module, string, uint32, uint32, uint32, uint32) uint32) func(context.Context, api.Module, uint32, uint32, uint32, uint32) uint32 {
 		return func(ctx context.Context, m api.Module, a, bb, c, d uint32) uint32 {
-			return h(ctx, m, cellID, a, bb, c, d)
+			return h(withScope(ctx), m, cellID, a, bb, c, d)
 		}
 	}
 	wrap2 := func(h func(context.Context, api.Module, string, uint32, uint32) uint32) func(context.Context, api.Module, uint32, uint32) uint32 {
 		return func(ctx context.Context, m api.Module, a, bb uint32) uint32 {
-			return h(ctx, m, cellID, a, bb)
+			return h(withScope(ctx), m, cellID, a, bb)
 		}
 	}
-	b.NewFunctionBuilder().WithFunc(dockerList).Export("docker_list")
-	b.NewFunctionBuilder().WithFunc(dockerGet).Export("docker_get")
+	b.NewFunctionBuilder().WithFunc(wrapScoped4(dockerList)).Export("docker_list")
+	b.NewFunctionBuilder().WithFunc(wrapScoped4(dockerGet)).Export("docker_get")
 	b.NewFunctionBuilder().WithFunc(wrap4(dockerCreate)).Export("docker_create")
 	b.NewFunctionBuilder().WithFunc(wrap2(dockerDestroy)).Export("docker_destroy")
 	b.NewFunctionBuilder().WithFunc(wrap2(dockerRestart)).Export("docker_restart")
@@ -614,10 +775,10 @@ func bindActive(b wazero.HostModuleBuilder, cell ext.Cell) error {
 	b.NewFunctionBuilder().WithFunc(wrap4(dockerFilesRead)).Export("docker_files_read")
 	b.NewFunctionBuilder().WithFunc(wrap2(dockerFilesWrite)).Export("docker_files_write")
 	b.NewFunctionBuilder().WithFunc(wrap2(dockerFilesDelete)).Export("docker_files_delete")
-	b.NewFunctionBuilder().WithFunc(dockerEventsPoll).Export("docker_events_poll")
-	b.NewFunctionBuilder().WithFunc(dockerStatsAll).Export("docker_stats_all")
-	b.NewFunctionBuilder().WithFunc(dockerBuild).Export("docker_build")
-	b.NewFunctionBuilder().WithFunc(dockerBuildStatus).Export("docker_build_status")
+	b.NewFunctionBuilder().WithFunc(wrapScoped4(dockerEventsPoll)).Export("docker_events_poll")
+	b.NewFunctionBuilder().WithFunc(wrapScoped4(dockerStatsAll)).Export("docker_stats_all")
+	b.NewFunctionBuilder().WithFunc(wrapScoped2(dockerBuild)).Export("docker_build")
+	b.NewFunctionBuilder().WithFunc(wrapScoped4(dockerBuildStatus)).Export("docker_build_status")
 	return nil
 }
 
@@ -645,7 +806,7 @@ func bindStub(b wazero.HostModuleBuilder, _ ext.Cell) error {
 // ---- handlers -----------------------------------------------------------
 
 func dockerList(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut, respLenOut uint32) uint32 {
-	p, err := ensureProvider()
+	p, err := ensureProvider(ctx)
 	if err != nil {
 		return codeProviderUnavail
 	}
@@ -668,15 +829,18 @@ func dockerList(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut, r
 		m.Memory().WriteUint32Le(respLenOut, 0)
 		return codeOK
 	}
-	result := make([]createResponse, len(servers))
-	for i, s := range servers {
-		result[i] = serverToResponse(&s)
+	result := make([]createResponse, 0, len(servers))
+	for _, s := range servers {
+		if !scopingDisabled() && !nameOwnedByScope(s.Name, dockerScopeFromContext(ctx)) {
+			continue
+		}
+		result = append(result, serverToResponse(&s))
 	}
 	return writeMsgpackResponse(ctx, m, result, respPtrOut, respLenOut)
 }
 
 func dockerGet(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut, respLenOut uint32) uint32 {
-	p, err := ensureProvider()
+	p, err := ensureProvider(ctx)
 	if err != nil {
 		return codeProviderUnavail
 	}
@@ -691,6 +855,9 @@ func dockerGet(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut, re
 	if req.Name == "" {
 		return codeInvalidRequest
 	}
+	if code := authorizeTarget(ctx, p, "", req.Name); code != codeOK {
+		return code
+	}
 	server, err := p.Get(ctx, req.Name)
 	if err != nil {
 		return translateDockerErr(err)
@@ -699,7 +866,7 @@ func dockerGet(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut, re
 }
 
 func dockerCreate(ctx context.Context, m api.Module, cellID string, reqPtr, reqLen, respPtrOut, respLenOut uint32) uint32 {
-	p, err := ensureProvider()
+	p, err := ensureProvider(ctx)
 	if err != nil {
 		return codeProviderUnavail
 	}
@@ -723,7 +890,7 @@ func dockerCreate(ctx context.Context, m api.Module, cellID string, reqPtr, reqL
 	// destroy/exec/files/restart/logs/stats can verify the caller owns the
 	// target. Skipped only in whole-host mode (DOCKER_SCOPE_DISABLE).
 	if !scopingDisabled() {
-		prefix := cellPrefix(cellID)
+		prefix := scopePrefix(dockerScopeFromContext(ctx))
 		trimmed := strings.TrimPrefix(req.Name, "/")
 		if !strings.HasPrefix(trimmed, prefix) {
 			req.Name = prefix + trimmed
@@ -764,7 +931,7 @@ func dockerCreate(ctx context.Context, m api.Module, cellID string, reqPtr, reqL
 }
 
 func dockerDestroy(ctx context.Context, m api.Module, cellID string, reqPtr, reqLen uint32) uint32 {
-	p, err := ensureProvider()
+	p, err := ensureProvider(ctx)
 	if err != nil {
 		return codeProviderUnavail
 	}
@@ -789,7 +956,7 @@ func dockerDestroy(ctx context.Context, m api.Module, cellID string, reqPtr, req
 }
 
 func dockerRestart(ctx context.Context, m api.Module, cellID string, reqPtr, reqLen uint32) uint32 {
-	p, err := ensureProvider()
+	p, err := ensureProvider(ctx)
 	if err != nil {
 		return codeProviderUnavail
 	}
@@ -814,7 +981,7 @@ func dockerRestart(ctx context.Context, m api.Module, cellID string, reqPtr, req
 }
 
 func dockerExec(ctx context.Context, m api.Module, cellID string, reqPtr, reqLen, respPtrOut, respLenOut uint32) uint32 {
-	p, err := ensureProvider()
+	p, err := ensureProvider(ctx)
 	if err != nil {
 		return codeProviderUnavail
 	}
@@ -840,7 +1007,7 @@ func dockerExec(ctx context.Context, m api.Module, cellID string, reqPtr, reqLen
 }
 
 func dockerLogs(ctx context.Context, m api.Module, cellID string, reqPtr, reqLen, respPtrOut, respLenOut uint32) uint32 {
-	p, err := ensureProvider()
+	p, err := ensureProvider(ctx)
 	if err != nil {
 		return codeProviderUnavail
 	}
@@ -873,7 +1040,7 @@ func dockerLogs(ctx context.Context, m api.Module, cellID string, reqPtr, reqLen
 }
 
 func dockerStats(ctx context.Context, m api.Module, cellID string, reqPtr, reqLen, respPtrOut, respLenOut uint32) uint32 {
-	p, err := ensureProvider()
+	p, err := ensureProvider(ctx)
 	if err != nil {
 		return codeProviderUnavail
 	}
@@ -899,7 +1066,7 @@ func dockerStats(ctx context.Context, m api.Module, cellID string, reqPtr, reqLe
 }
 
 func dockerFilesRead(ctx context.Context, m api.Module, cellID string, reqPtr, reqLen, respPtrOut, respLenOut uint32) uint32 {
-	p, err := ensureProvider()
+	p, err := ensureProvider(ctx)
 	if err != nil {
 		return codeProviderUnavail
 	}
@@ -928,7 +1095,7 @@ func dockerFilesRead(ctx context.Context, m api.Module, cellID string, reqPtr, r
 }
 
 func dockerFilesWrite(ctx context.Context, m api.Module, cellID string, reqPtr, reqLen uint32) uint32 {
-	p, err := ensureProvider()
+	p, err := ensureProvider(ctx)
 	if err != nil {
 		return codeProviderUnavail
 	}
@@ -953,7 +1120,7 @@ func dockerFilesWrite(ctx context.Context, m api.Module, cellID string, reqPtr, 
 }
 
 func dockerFilesDelete(ctx context.Context, m api.Module, cellID string, reqPtr, reqLen uint32) uint32 {
-	p, err := ensureProvider()
+	p, err := ensureProvider(ctx)
 	if err != nil {
 		return codeProviderUnavail
 	}
@@ -978,7 +1145,11 @@ func dockerFilesDelete(ctx context.Context, m api.Module, cellID string, reqPtr,
 }
 
 func dockerEventsPoll(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut, respLenOut uint32) uint32 {
-	if _, err := ensureProvider(); err != nil {
+	if _, err := ensureProvider(ctx); err != nil {
+		return codeProviderUnavail
+	}
+	state, err := dockerStateForContext(ctx)
+	if err != nil || state.eventBuf == nil {
 		return codeProviderUnavail
 	}
 	var req eventsPollRequest
@@ -994,12 +1165,15 @@ func dockerEventsPoll(ctx context.Context, m api.Module, reqPtr, reqLen, respPtr
 	if req.Limit <= 0 {
 		req.Limit = 100
 	}
-	events := eventBuf.since(req.SinceNanos, req.Limit)
+	scope := dockerScopeFromContext(ctx)
+	events := state.eventBuf.sinceMatching(req.SinceNanos, req.Limit, func(event eventEntry) bool {
+		return scopingDisabled() || nameOwnedByScope(event.Name, scope)
+	})
 	return writeMsgpackResponse(ctx, m, events, respPtrOut, respLenOut)
 }
 
 func dockerStatsAll(ctx context.Context, m api.Module, _ uint32, _ uint32, respPtrOut, respLenOut uint32) uint32 {
-	p, err := ensureProvider()
+	p, err := ensureProvider(ctx)
 	if err != nil {
 		return codeProviderUnavail
 	}
@@ -1007,30 +1181,37 @@ func dockerStatsAll(ctx context.Context, m api.Module, _ uint32, _ uint32, respP
 	if err != nil {
 		return translateDockerErr(err)
 	}
-	result := make([]statsResponse, len(stats))
+	result := make([]statsResponse, 0, len(stats))
 	for i := range stats {
-		result[i] = containerStatsToResponse(&stats[i])
+		if !scopingDisabled() && !nameOwnedByScope(stats[i].Name, dockerScopeFromContext(ctx)) {
+			continue
+		}
+		result = append(result, containerStatsToResponse(&stats[i]))
 	}
 	return writeMsgpackResponse(ctx, m, result, respPtrOut, respLenOut)
 }
 
 func dockerBuild(ctx context.Context, m api.Module, reqPtr, reqLen uint32) uint32 {
-	if !buildMu.TryLock() {
+	state, err := dockerStateForContext(ctx)
+	if err != nil {
+		return codeProviderUnavail
+	}
+	if !state.buildMu.TryLock() {
 		return codeBuildInProgress
 	}
 
 	data, ok := m.Memory().Read(reqPtr, reqLen)
 	if !ok {
-		buildMu.Unlock()
+		state.buildMu.Unlock()
 		return codeMemoryRead
 	}
 	var req buildRequest
 	if err := msgpack.Unmarshal(data, &req); err != nil {
-		buildMu.Unlock()
+		state.buildMu.Unlock()
 		return codeMsgpackDecode
 	}
 	if req.ImageTag == "" {
-		buildMu.Unlock()
+		state.buildMu.Unlock()
 		return codeInvalidRequest
 	}
 
@@ -1043,7 +1224,7 @@ func dockerBuild(ctx context.Context, m api.Module, reqPtr, reqLen uint32) uint3
 	}
 	absDir, err := filepath.Abs(req.BuildDir)
 	if err != nil {
-		buildMu.Unlock()
+		state.buildMu.Unlock()
 		return codeInvalidRequest
 	}
 	allowedBase := os.Getenv("TEMPLATES_DIR")
@@ -1052,14 +1233,14 @@ func dockerBuild(ctx context.Context, m api.Module, reqPtr, reqLen uint32) uint3
 	}
 	absBase, _ := filepath.Abs(allowedBase)
 	if !pathContains(absBase, absDir) {
-		buildMu.Unlock()
+		state.buildMu.Unlock()
 		return codeInvalidRequest
 	}
 
-	buildStateMu.Lock()
-	buildState.Building = true
-	buildState.LastError = ""
-	buildStateMu.Unlock()
+	state.buildStateMu.Lock()
+	state.buildState.Building = true
+	state.buildState.LastError = ""
+	state.buildStateMu.Unlock()
 
 	// Detach the build from the caller's request-scoped context — the
 	// cell-side host call returns immediately, so ctx is cancelled
@@ -1068,11 +1249,11 @@ func dockerBuild(ctx context.Context, m api.Module, reqPtr, reqLen uint32) uint3
 	_ = ctx
 
 	go func() {
-		defer buildMu.Unlock()
+		defer state.buildMu.Unlock()
 		defer func() {
-			buildStateMu.Lock()
-			buildState.Building = false
-			buildStateMu.Unlock()
+			state.buildStateMu.Lock()
+			state.buildState.Building = false
+			state.buildStateMu.Unlock()
 		}()
 
 		args := []string{"build"}
@@ -1089,17 +1270,17 @@ func dockerBuild(ctx context.Context, m api.Module, reqPtr, reqLen uint32) uint3
 
 		if err := cmd.Run(); err != nil {
 			errMsg := fmt.Sprintf("%v: %s", err, out.String())
-			buildStateMu.Lock()
-			buildState.LastError = errMsg
-			buildStateMu.Unlock()
+			state.buildStateMu.Lock()
+			state.buildState.LastError = errMsg
+			state.buildStateMu.Unlock()
 			log.Printf("[pulp-ext-docker] build failed: %s", errMsg)
 			return
 		}
 
 		now := time.Now().Unix()
-		buildStateMu.Lock()
-		buildState.LastBuildTime = now
-		buildStateMu.Unlock()
+		state.buildStateMu.Lock()
+		state.buildState.LastBuildTime = now
+		state.buildStateMu.Unlock()
 		log.Printf("[pulp-ext-docker] build success: %s", req.ImageTag)
 	}()
 
@@ -1107,9 +1288,13 @@ func dockerBuild(ctx context.Context, m api.Module, reqPtr, reqLen uint32) uint3
 }
 
 func dockerBuildStatus(ctx context.Context, m api.Module, _ uint32, _ uint32, respPtrOut, respLenOut uint32) uint32 {
-	buildStateMu.RLock()
-	snapshot := buildState
-	buildStateMu.RUnlock()
+	state, err := dockerStateForContext(ctx)
+	if err != nil {
+		return codeProviderUnavail
+	}
+	state.buildStateMu.RLock()
+	snapshot := state.buildState
+	state.buildStateMu.RUnlock()
 	return writeMsgpackResponse(ctx, m, snapshot, respPtrOut, respLenOut)
 }
 
@@ -1184,11 +1369,18 @@ func (b *eventBuffer) append(containerID, name, action string) {
 }
 
 func (b *eventBuffer) since(sinceNanos int64, limit int) []eventEntry {
+	return b.sinceMatching(sinceNanos, limit, nil)
+}
+
+func (b *eventBuffer) sinceMatching(sinceNanos int64, limit int, accept func(eventEntry) bool) []eventEntry {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.prune(time.Now().UnixNano())
 	out := make([]eventEntry, 0, 16)
 	for _, e := range b.events {
+		if accept != nil && !accept(e) {
+			continue
+		}
 		if e.Timestamp > sinceNanos {
 			out = append(out, e)
 			if limit > 0 && len(out) >= limit {
