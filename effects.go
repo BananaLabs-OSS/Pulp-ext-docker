@@ -19,12 +19,13 @@ import (
 const (
 	// The public defaults are Fiber's canonical, versioned host-effect kinds.
 	// New state owners must emit them through effect.Intent.
-	EffectProvision   = effect.KindFleetServerProvision
-	EffectReconfigure = effect.KindFleetServerReconfigure
-	EffectSuspend     = effect.KindFleetServerSuspend
-	EffectResume      = effect.KindFleetServerResume
-	EffectDeprovision = effect.KindFleetServerDeprovision
-	EffectExtension   = effect.KindFleetExtensionApply
+	EffectProvision          = effect.KindFleetServerProvision
+	EffectReconfigure        = effect.KindFleetServerReconfigure
+	EffectSuspend            = effect.KindFleetServerSuspend
+	EffectResume             = effect.KindFleetServerResume
+	EffectDeprovision        = effect.KindFleetServerDeprovision
+	EffectExtension          = effect.KindFleetExtensionApply
+	EffectRuntimeObservation = effect.KindFleetRuntimeObservationExecute
 
 	// CanonicalEffect* remain source-compatible names for callers that adopted
 	// the first contract-adaptation branch before its public constants settled.
@@ -350,7 +351,7 @@ func (e *EffectExecutor) apply(ctx context.Context, scope ext.Scope, effect Flee
 			Scope: scope, ServerID: serverID, NodeID: optionalPayloadString(payload, "node_id"),
 			ContainerID: containerID, Payload: payload,
 		})
-	case CanonicalEffectReconfigure, CanonicalEffectSuspend, CanonicalEffectResume, CanonicalEffectExtension:
+	case CanonicalEffectReconfigure, CanonicalEffectSuspend, CanonicalEffectResume, CanonicalEffectExtension, EffectRuntimeObservation:
 		backend, ok := e.backend.(CanonicalFleetBackend)
 		if !ok {
 			return nil, fmt.Errorf("docker effects: canonical fleet effect %q is not configured", canonicalEffectKind(effect.Kind))
@@ -404,6 +405,8 @@ func canonicalEffectKind(kind string) string {
 		return canonical
 	}
 	switch kind {
+	case "sessions.fleet.provision.request":
+		return EffectProvision
 	case "sessions.fleet.upload.request":
 		return EffectUpload
 	case "sessions.fleet.world.delete":

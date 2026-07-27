@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -16,11 +17,17 @@ type fakeHostFleetRuntime struct {
 	allocated     []orchestrator.AllocateRequest
 	deallocated   []string
 	executed      []fakeRuntimeExec
+	restarted     []string
 	servers       map[string]*orchestrator.Server
 	err           error
 	getErr        error
 	deallocateErr error
 	nameOverride  string
+	operation     int
+	failAfter     int
+	running       bool
+	regenMarker   bool
+	savesEnabled  bool
 }
 
 type fakeRuntimeExec struct {
@@ -75,7 +82,30 @@ func (f *fakeHostFleetRuntime) Exec(_ context.Context, containerID string, comma
 		return "", f.err
 	}
 	f.executed = append(f.executed, fakeRuntimeExec{containerID: containerID, command: append([]string(nil), command...)})
+	switch {
+	case reflect.DeepEqual(command, []string{"rcon", "save-off"}):
+		f.savesEnabled = false
+	case reflect.DeepEqual(command, []string{"sh", "-c", "touch /data/.sessions-regen"}):
+		f.regenMarker = true
+	}
+	f.operation++
+	if f.failAfter == f.operation {
+		return "", errors.New("simulated host crash after operation")
+	}
 	return "", nil
+}
+
+func (f *fakeHostFleetRuntime) Restart(_ context.Context, containerID string) error {
+	if f.err != nil {
+		return f.err
+	}
+	f.restarted = append(f.restarted, containerID)
+	f.running = true
+	f.operation++
+	if f.failAfter == f.operation {
+		return errors.New("simulated host crash after operation")
+	}
+	return nil
 }
 
 func TestHostScopedEffectExecutorUsesOnlyScopedTypedDockerProvision(t *testing.T) {

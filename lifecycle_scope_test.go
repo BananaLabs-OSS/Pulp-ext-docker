@@ -120,6 +120,9 @@ func resetDockerScopesForTest(t *testing.T) {
 		if state.eventsCancel != nil {
 			state.eventsCancel()
 		}
+		if state.provider != nil {
+			_ = state.provider.Close()
+		}
 	}
 	t.Cleanup(func() { resetDockerScopesForTestCleanup() })
 }
@@ -133,6 +136,9 @@ func resetDockerScopesForTestCleanup() {
 	for _, state := range states {
 		if state.eventsCancel != nil {
 			state.eventsCancel()
+		}
+		if state.provider != nil {
+			_ = state.provider.Close()
 		}
 	}
 }

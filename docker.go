@@ -20,6 +20,7 @@
 //
 //	docker_list(req, resp)
 //	docker_get(req, resp)
+//	docker_get_owned(req, resp) // imported from host module "pulp"
 //	docker_create(req, resp)
 //	docker_destroy(req)
 //	docker_restart(req)
@@ -44,6 +45,7 @@ import (
 	"os"
 	osexec "os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -113,6 +115,7 @@ func translateDockerErr(err error) uint32 {
 func init() {
 	ext.Register(ext.Capability{
 		Name:          "spawn.docker",
+		Provider:      "github.com/BananaLabs-OSS/Pulp-ext-docker",
 		Register:      bindActive,
 		Stub:          bindStub,
 		Setup:         setupDockerScope,
@@ -130,6 +133,7 @@ type dockerScopeState struct {
 	scope              ext.Scope
 	mu                 sync.Mutex
 	provider           *docker.DockerProvider
+	providerEndpoint   string
 	providerErr        error
 	providerRetryAfter time.Time
 	eventBuf           *eventBuffer
@@ -224,6 +228,7 @@ func (s *dockerScopeState) ensureProvider() (*docker.DockerProvider, error) {
 	}
 	s.providerErr = nil
 	s.provider = p
+	s.providerEndpoint = os.Getenv("DOCKER_HOST")
 
 	// Start event consumer that fills the ring buffer for polling.
 	// Docker's SDK hands back channels immediately, so we can't use
@@ -315,8 +320,23 @@ func teardownDockerScope(_ context.Context, scope ext.Scope) error {
 		}
 	}
 	dockerScopes.Unlock()
-	if state != nil && state.eventsCancel != nil {
-		state.eventsCancel()
+	if state == nil {
+		return nil
+	}
+	state.mu.Lock()
+	cancel := state.eventsCancel
+	state.eventsCancel = nil
+	provider := state.provider
+	state.provider = nil
+	state.providerEndpoint = ""
+	state.providerErr = nil
+	state.providerRetryAfter = time.Time{}
+	state.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	if provider != nil {
+		return provider.Close()
 	}
 	return nil
 }
@@ -382,6 +402,13 @@ type idRequest struct {
 
 type nameRequest struct {
 	Name string `msgpack:"name"`
+}
+
+// ownedNameRequest contains only an application-local logical container name.
+// The host derives the Pulp scope prefix; callers must never construct or
+// supply a Docker runtime prefix themselves.
+type ownedNameRequest struct {
+	LogicalName string `msgpack:"logical_name"`
 }
 
 type filesDeleteRequest struct {
@@ -710,6 +737,46 @@ func nameOwnedByScope(name string, scope ext.Scope) bool {
 	return strings.HasPrefix(name, scopePrefix(scope))
 }
 
+var ownedLogicalName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$`)
+
+// ownedDockerRuntimeName turns one bounded logical name into the exact Docker
+// name owned by scope. This is intentionally not a suffix/prefix search: the
+// provider receives precisely one name and its returned server is verified
+// against that same name before it crosses the guest ABI.
+func ownedDockerRuntimeName(scope ext.Scope, logicalName string) (string, error) {
+	if err := scope.Validate(); err != nil {
+		return "", fmt.Errorf("docker owned get: scope: %w", err)
+	}
+	if !ownedLogicalName.MatchString(logicalName) || strings.HasPrefix(logicalName, scopePrefix(scope)) {
+		return "", errors.New("docker owned get: logical_name is invalid")
+	}
+	return scopePrefix(scope) + logicalName, nil
+}
+
+type ownedDockerGetProvider interface {
+	Get(context.Context, string) (*orchestrator.Server, error)
+}
+
+func resolveOwnedDockerServer(ctx context.Context, provider ownedDockerGetProvider, scope ext.Scope, logicalName string) (*orchestrator.Server, uint32) {
+	if provider == nil {
+		return nil, codeProviderUnavail
+	}
+	runtimeName, err := ownedDockerRuntimeName(scope, logicalName)
+	if err != nil {
+		return nil, codeInvalidRequest
+	}
+	server, err := provider.Get(ctx, runtimeName)
+	if err != nil {
+		return nil, translateDockerErr(err)
+	}
+	if server == nil || strings.TrimPrefix(server.Name, "/") != runtimeName || !nameOwnedByScope(server.Name, scope) {
+		// A foreign or substituted provider result must be indistinguishable
+		// from a missing owned container. Do not create an ownership oracle.
+		return nil, codeNotFound
+	}
+	return server, codeOK
+}
+
 // authorizeTarget verifies that the container identified by target (ID or name)
 // is owned by cellID. It returns codeOK when allowed, a non-OK host code
 // otherwise. Scoping is skipped entirely when DOCKER_SCOPE_DISABLE is set.
@@ -766,6 +833,7 @@ func bindActive(b wazero.HostModuleBuilder, cell ext.Cell) error {
 	}
 	b.NewFunctionBuilder().WithFunc(wrapScoped4(dockerList)).Export("docker_list")
 	b.NewFunctionBuilder().WithFunc(wrapScoped4(dockerGet)).Export("docker_get")
+	b.NewFunctionBuilder().WithFunc(wrapScoped4(dockerGetOwned)).Export("docker_get_owned")
 	b.NewFunctionBuilder().WithFunc(wrap4(dockerCreate)).Export("docker_create")
 	b.NewFunctionBuilder().WithFunc(wrap2(dockerDestroy)).Export("docker_destroy")
 	b.NewFunctionBuilder().WithFunc(wrap2(dockerRestart)).Export("docker_restart")
@@ -787,6 +855,7 @@ func bindStub(b wazero.HostModuleBuilder, _ ext.Cell) error {
 	nop2 := func(_ context.Context, _ api.Module, _, _ uint32) uint32 { return 99 }
 	b.NewFunctionBuilder().WithFunc(nop4).Export("docker_list")
 	b.NewFunctionBuilder().WithFunc(nop4).Export("docker_get")
+	b.NewFunctionBuilder().WithFunc(dockerGetOwnedStub).Export("docker_get_owned")
 	b.NewFunctionBuilder().WithFunc(nop4).Export("docker_create")
 	b.NewFunctionBuilder().WithFunc(nop2).Export("docker_destroy")
 	b.NewFunctionBuilder().WithFunc(nop2).Export("docker_restart")
@@ -863,6 +932,37 @@ func dockerGet(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut, re
 		return translateDockerErr(err)
 	}
 	return writeMsgpackResponse(ctx, m, serverToResponse(server), respPtrOut, respLenOut)
+}
+
+// dockerGetOwned resolves exactly one container name derived from the
+// host-captured application/cell scope. Unlike docker_get, it accepts no raw
+// Docker ID or runtime name and therefore cannot be used to probe sibling
+// cells, applications, or host containers.
+func dockerGetOwned(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut, respLenOut uint32) uint32 {
+	p, err := ensureProvider(ctx)
+	if err != nil {
+		return codeProviderUnavail
+	}
+	data, ok := m.Memory().Read(reqPtr, reqLen)
+	if !ok {
+		return codeMemoryRead
+	}
+	var req ownedNameRequest
+	if err := msgpack.Unmarshal(data, &req); err != nil {
+		return codeMsgpackDecode
+	}
+	server, code := resolveOwnedDockerServer(ctx, p, dockerScopeFromContext(ctx), req.LogicalName)
+	if code != codeOK {
+		return code
+	}
+	// Fiber's canonical guest Docker Server uses lower-case MessagePack keys;
+	// retain the established create/get projection rather than exposing the
+	// provider struct's Go field names directly.
+	return writeMsgpackResponse(ctx, m, serverToResponse(server), respPtrOut, respLenOut)
+}
+
+func dockerGetOwnedStub(_ context.Context, _ api.Module, _, _, _, _ uint32) uint32 {
+	return codeCapabilityStubbed
 }
 
 func dockerCreate(ctx context.Context, m api.Module, cellID string, reqPtr, reqLen, respPtrOut, respLenOut uint32) uint32 {
